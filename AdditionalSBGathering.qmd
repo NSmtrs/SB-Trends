@@ -1,0 +1,436 @@
+---
+title: "PlayerSBDataPrep"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+
+It should be noted that in the Power BI I decided to use qualified players with PAs greater or equal to a 10 minimum
+
+```{r}
+# ==========================================================
+# Combine per-season player SB scoring CSVs into one file
+# ==========================================================
+# Expects files named like:
+#   player_sb_scoring_stats_2009.csv
+#   player_sb_scoring_stats_2010.csv
+#   ...
+#   player_sb_scoring_stats_2025.csv
+# (2020 is skipped)
+#
+# Output:
+#   player_sb_scoring_stats_2009_2025.csv
+# ==========================================================
+
+# ---- USER SETTINGS ----
+input_dir   <- "."   # folder containing the per-season CSVs (use "." for current dir)
+output_file <- "player_sb_scoring_stats_2009_2025.csv"
+
+years <- c(2009:2019, 2021:2025)   # 2020 intentionally skipped
+
+# ---- Install + load packages ----
+required_pkgs <- c("dplyr", "readr")
+to_install <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(dplyr)
+library(readr)
+
+# ---- Build expected file paths ----
+files <- file.path(input_dir, sprintf("player_sb_scoring_stats_%d.csv", years))
+
+# Warn about any missing files but keep going with the ones we have
+missing_files <- files[!file.exists(files)]
+if (length(missing_files) > 0) {
+  warning(
+    "The following files were not found and will be skipped:\n  ",
+    paste(missing_files, collapse = "\n  ")
+  )
+  files <- files[file.exists(files)]
+}
+
+if (length(files) == 0) {
+  stop("No per-season CSVs were found in '", input_dir, "'. Check the path.")
+}
+
+# ---- Read and combine ----
+combined <- files |>
+  lapply(readr::read_csv, show_col_types = FALSE) |>
+  dplyr::bind_rows() |>
+  dplyr::arrange(year, team_name, player_name)
+
+# ---- Write output ----
+readr::write_csv(combined, output_file)
+
+cat(sprintf(
+  "Done. Combined %d files into '%s' (%d rows).\n",
+  length(files), output_file, nrow(combined)
+))
+print(utils::head(combined))
+```
+
+OBP and PA with the CSV above
+
+```{r, echo = FALSE}
+# ==========================================================
+# Add season OBP and Plate Appearances to the combined CSV
+# ==========================================================
+# Reads:   player_sb_scoring_stats_2009_2025.csv
+# Writes:  player_sb_scoring_stats_2009_2025_with_obp.csv
+#
+# Adds two columns:
+#   season_obp                -> player's OBP for that season
+#   season_plate_appearances  -> player's total PA for that season
+#
+# Pulls directly from the MLB Stats API:
+#   https://statsapi.mlb.com/api/v1/people/{playerId}/stats
+# ==========================================================
+
+# ---- USER SETTINGS ----
+input_file  <- "player_sb_scoring_stats_2009_2025.csv"
+output_file <- "player_sb_scoring_stats_2009_2025_with_obp.csv"
+
+# Polite pacing between API calls (seconds)
+request_delay_sec <- 0.10
+max_retries       <- 5
+base_backoff_sec  <- 2
+
+# The 30 active MLB franchises (MLB Stats API team IDs).
+# Any row whose team_id isn't in here will be dropped.
+MLB_TEAM_IDS <- c(
+  108,  # Los Angeles Angels
+  109,  # Arizona Diamondbacks
+  110,  # Baltimore Orioles
+  111,  # Boston Red Sox
+  112,  # Chicago Cubs
+  113,  # Cincinnati Reds
+  114,  # Cleveland Guardians
+  115,  # Colorado Rockies
+  116,  # Detroit Tigers
+  117,  # Houston Astros
+  118,  # Kansas City Royals
+  119,  # Los Angeles Dodgers
+  120,  # Washington Nationals
+  121,  # New York Mets
+  133,  # Oakland / Sacramento Athletics
+  134,  # Pittsburgh Pirates
+  135,  # San Diego Padres
+  136,  # Seattle Mariners
+  137,  # San Francisco Giants
+  138,  # St. Louis Cardinals
+  139,  # Tampa Bay Rays
+  140,  # Texas Rangers
+  141,  # Toronto Blue Jays
+  142,  # Minnesota Twins
+  143,  # Philadelphia Phillies
+  144,  # Atlanta Braves
+  145,  # Chicago White Sox
+  146,  # Miami Marlins
+  147,  # New York Yankees
+  158   # Milwaukee Brewers
+)
+
+# ---- Install + load packages ----
+required_pkgs <- c("dplyr", "readr", "httr", "jsonlite")
+to_install <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(dplyr)
+library(readr)
+library(httr)
+library(jsonlite)
+
+# ---- Read combined file ----
+if (!file.exists(input_file)) {
+  stop("Could not find '", input_file, "'. Set the working directory with setwd() ",
+       "or change the input_file path at the top of this script.")
+}
+
+dat <- readr::read_csv(input_file, show_col_types = FALSE)
+
+# Sanity: required columns
+need_cols <- c("player_id", "year", "team_id")
+missing_cols <- setdiff(need_cols, names(dat))
+if (length(missing_cols) > 0) {
+  stop("Input is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# ---- Filter: keep only rows whose team_id is one of the 30 MLB franchises ----
+n_before <- nrow(dat)
+dat <- dat |>
+  dplyr::filter(team_id %in% MLB_TEAM_IDS)
+n_after <- nrow(dat)
+
+cat(sprintf(
+  "Filtered out %d row(s) without an MLB team_id (kept %d of %d).\n",
+  n_before - n_after, n_after, n_before
+))
+
+if (n_after == 0) {
+  stop("No rows remain after filtering to MLB teams. ",
+       "Double-check the team_id column in your input file.")
+}
+
+# ---- Helper: fetch one (player_id, year) season hitting line ----
+fetch_season_hitting <- function(player_id, year) {
+  url <- sprintf(
+    "https://statsapi.mlb.com/api/v1/people/%d/stats?stats=season&group=hitting&season=%d&sportId=1",
+    as.integer(player_id), as.integer(year)
+  )
+
+  for (attempt in seq_len(max_retries)) {
+    resp <- tryCatch(
+      httr::GET(url, httr::timeout(30)),
+      error = function(e) e
+    )
+
+    if (inherits(resp, "error")) {
+      msg <- conditionMessage(resp)
+    } else if (httr::status_code(resp) == 200) {
+      parsed <- tryCatch(
+        jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"),
+                           simplifyVector = FALSE),
+        error = function(e) e
+      )
+      if (inherits(parsed, "error")) {
+        msg <- paste("JSON parse failed:", conditionMessage(parsed))
+      } else {
+        # Walk: parsed$stats[[1]]$splits[[1]]$stat
+        splits <- tryCatch(parsed$stats[[1]]$splits, error = function(e) NULL)
+        if (is.null(splits) || length(splits) == 0) {
+          # No hitting stats for this player-season (e.g., pitcher in pre-DH AL year)
+          return(list(obp = NA_real_, pa = NA_integer_))
+        }
+        stat <- splits[[1]]$stat
+        obp_val <- suppressWarnings(as.numeric(stat$obp))
+        pa_val  <- suppressWarnings(as.integer(stat$plateAppearances))
+        return(list(obp = obp_val, pa = pa_val))
+      }
+    } else {
+      msg <- paste("HTTP", httr::status_code(resp))
+    }
+
+    # Backoff and retry
+    sleep_for <- min(60, base_backoff_sec * (2 ^ (attempt - 1))) + runif(1, 0, 1)
+    message(sprintf(
+      "  [retry %d/%d] player %d, year %d failed (%s). Sleeping %.1fs...",
+      attempt, max_retries - 1, player_id, year, msg, sleep_for
+    ))
+    Sys.sleep(sleep_for)
+  }
+
+  warning(sprintf("Giving up on player %d, year %d after %d retries.",
+                  player_id, year, max_retries))
+  list(obp = NA_real_, pa = NA_integer_)
+}
+
+# ---- Build the unique (player_id, year) lookup table ----
+lookup <- dat |>
+  dplyr::distinct(player_id, year) |>
+  dplyr::filter(!is.na(player_id), !is.na(year)) |>
+  dplyr::arrange(year, player_id)
+
+cat(sprintf("Fetching OBP + PA for %d unique (player, season) combinations...\n",
+            nrow(lookup)))
+
+obp_vec <- numeric(nrow(lookup))
+pa_vec  <- integer(nrow(lookup))
+
+# Simple progress every 25 calls
+for (i in seq_len(nrow(lookup))) {
+  res <- fetch_season_hitting(lookup$player_id[i], lookup$year[i])
+  obp_vec[i] <- res$obp
+  pa_vec[i]  <- res$pa
+  if (request_delay_sec > 0) Sys.sleep(request_delay_sec)
+  if (i %% 25 == 0 || i == nrow(lookup)) {
+    cat(sprintf("  ...processed %d / %d\n", i, nrow(lookup)))
+  }
+}
+
+lookup$season_obp <- obp_vec
+lookup$season_plate_appearances <- pa_vec
+
+# ---- Join back into the main dataset and write out ----
+out <- dat |>
+  dplyr::left_join(lookup, by = c("player_id", "year"))
+
+readr::write_csv(out, output_file)
+
+cat(sprintf("\nDone. Wrote '%s' (%d rows).\n", output_file, nrow(out)))
+print(utils::head(out))
+```
+
+Code for stolen bases full (some of the data was slightly off, probably due to some amount of tracking differences)
+```{r, echo = false}
+# ==========================================================
+# Bulk-pull season hitting totals for every MLB batter
+# from 2009-2025 (skipping 2020) — paginated, includes
+# non-qualifying batters via playerPool=All.
+#
+# Output columns:
+#   player_id, player_name, team_id, team_name, year,
+#   season_stolen_bases, season_runs, season_obp,
+#   season_plate_appearances
+#
+# Traded players: stats summed across team stints,
+# "primary team" = team where player had most PAs.
+# ==========================================================
+
+# ---- USER SETTINGS ----
+output_file      <- "all_player_season_hitting_2009_2025.csv"
+years            <- c(2009:2019, 2021:2025)   # 2020 skipped
+page_size        <- 100
+hard_max_pages   <- 200
+max_retries      <- 5
+base_backoff_sec <- 2
+
+# ---- Packages ----
+required_pkgs <- c("dplyr", "readr", "httr", "jsonlite")
+to_install <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(dplyr)
+library(readr)
+library(httr)
+library(jsonlite)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ---- Pull one PAGE of a season's hitting stats ----
+fetch_page <- function(year, offset) {
+  url <- sprintf(
+    paste0(
+      "https://statsapi.mlb.com/api/v1/stats?",
+      "stats=season&group=hitting&season=%d&sportId=1",
+      "&limit=%d&offset=%d&playerPool=All"
+    ),
+    year, page_size, offset
+  )
+  
+  for (attempt in seq_len(max_retries)) {
+    resp <- tryCatch(httr::GET(url, httr::timeout(60)), error = function(e) e)
+    
+    if (!inherits(resp, "error") && httr::status_code(resp) == 200) {
+      parsed <- tryCatch(
+        jsonlite::fromJSON(
+          httr::content(resp, as = "text", encoding = "UTF-8"),
+          simplifyVector = FALSE
+        ),
+        error = function(e) e
+      )
+      if (!inherits(parsed, "error")) {
+        splits <- parsed$stats[[1]]$splits
+        if (is.null(splits) || length(splits) == 0) {
+          return(empty_frame())
+        }
+        rows <- lapply(splits, function(s) {
+          data.frame(
+            player_id = as.integer(s$player$id %||% NA),
+            player_name = as.character(s$player$fullName %||% NA),
+            team_id = as.integer(s$team$id %||% NA),
+            team_name = as.character(s$team$name %||% NA),
+            year = year,
+            season_stolen_bases = suppressWarnings(
+              as.integer(s$stat$stolenBases %||% NA)
+            ),
+            season_runs = suppressWarnings(
+              as.integer(s$stat$runs %||% NA)
+            ),
+            season_obp = suppressWarnings(
+              as.numeric(s$stat$obp %||% NA)
+            ),
+            season_plate_appearances = suppressWarnings(
+              as.integer(s$stat$plateAppearances %||% NA)
+            )
+          )
+        })
+        return(dplyr::bind_rows(rows))
+      }
+    }
+    
+    msg <- if (inherits(resp, "error")) conditionMessage(resp)
+    else paste("HTTP", httr::status_code(resp))
+    sleep_for <- min(60, base_backoff_sec * (2 ^ (attempt - 1))) + runif(1, 0, 1)
+    message(sprintf("  retry %d/%d for %d offset %d (%s) — sleeping %.1fs",
+                    attempt, max_retries - 1, year, offset, msg, sleep_for))
+    Sys.sleep(sleep_for)
+  }
+  
+  warning(sprintf("Giving up on year %d offset %d.", year, offset))
+  empty_frame()
+}
+
+# Convenience constructor for empty frames matching the schema
+empty_frame <- function() {
+  data.frame(
+    player_id = integer(0),
+    player_name = character(0),
+    team_id = integer(0),
+    team_name = character(0),
+    year = integer(0),
+    season_stolen_bases = integer(0),
+    season_runs = integer(0),
+    season_obp = numeric(0),
+    season_plate_appearances = integer(0)
+  )
+}
+
+# ---- Pull a full season by paging until empty ----
+fetch_season <- function(year) {
+  pages <- list()
+  for (p in seq_len(hard_max_pages)) {
+    offset <- (p - 1) * page_size
+    page <- fetch_page(year, offset)
+    if (nrow(page) == 0) break
+    pages[[p]] <- page
+    if (nrow(page) < page_size) break
+    Sys.sleep(0.15)
+  }
+  dplyr::bind_rows(pages)
+}
+
+# ---- Loop the years ----
+all_seasons <- list()
+for (yr in years) {
+  cat(sprintf("Pulling %d ...\n", yr))
+  s <- fetch_season(yr)
+  cat(sprintf("  ...%d raw rows for %d (before dedup)\n", nrow(s), yr))
+  all_seasons[[as.character(yr)]] <- s
+  Sys.sleep(0.3)
+}
+
+# ---- Aggregate traded players into one row per (player, year) ----
+combined <- dplyr::bind_rows(all_seasons) |>
+  dplyr::filter(!is.na(player_id)) |>
+  dplyr::group_by(player_id, year) |>
+  dplyr::summarise(
+    player_name = dplyr::first(player_name[!is.na(player_name)]),
+    team_id    = team_id[which.max(season_plate_appearances)][1],
+    team_name  = team_name[which.max(season_plate_appearances)][1],
+    season_stolen_bases      = sum(season_stolen_bases, na.rm = TRUE),
+    season_runs              = sum(season_runs, na.rm = TRUE),
+    season_plate_appearances = sum(season_plate_appearances, na.rm = TRUE),
+    season_obp = stats::weighted.mean(
+      season_obp, season_plate_appearances, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::select(
+    player_id, player_name, team_id, team_name, year,
+    season_stolen_bases, season_runs, season_obp, season_plate_appearances
+  ) |>
+  dplyr::arrange(year, player_id)
+
+readr::write_csv(combined, output_file)
+cat(sprintf("\nDone. Wrote %d rows to '%s'.\n", nrow(combined), output_file))
+print(utils::head(combined))
+
+```
