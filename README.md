@@ -87,4 +87,5 @@ Edit the date ranges and output paths at the top of each script to match your en
 - 2020 is intentionally skipped (shortened COVID season).
 - "Run scored after SB" is scoped to the same basepath trip — a stolen base earlier in the inning by a different runner doesn't count toward this player's metric.
 - Traded players' season stats are aggregated across team stints; their reported team is whichever they had the most plate appearances with.
+- Current issue in player dashboard where player stats divided between teams played with
 - Every API-touching script uses retry-with-exponential-backoff, so transient 503/timeout errors are handled gracefully and the runs are safe to re-execute.
